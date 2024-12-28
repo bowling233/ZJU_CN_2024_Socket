@@ -9,6 +9,10 @@
 #include <queue>
 #include <thread>
 #include <vector>
+#include <atomic>
+#include <fcntl.h>
+#include <sys/select.h>
+#include <cstring>
 
 std::mutex queueMutex;
 std::condition_variable cv;
@@ -16,6 +20,7 @@ std::queue<Packet> messageQueue;
 bool connected = false;
 int clientSocket = -1;
 std::thread receiveThread;
+std::atomic<bool> exitFlag(false);
 
 void receiveData()
 {
@@ -24,6 +29,15 @@ void receiveData()
 		int bytesReceived =
 			recv(clientSocket, buffer.data(), buffer.size(), 0);
 		if (bytesReceived <= 0) {
+			if (errno == EWOULDBLOCK || errno == EAGAIN) {
+				std::this_thread::sleep_for(
+					std::chrono::milliseconds(100));
+				continue;
+			} else {
+				connected = false;
+				break;
+			}
+		} else if (bytesReceived == 0) {
 			connected = false;
 			break;
 		}
@@ -41,7 +55,17 @@ void handleMessages()
 {
 	while (true) {
 		std::unique_lock<std::mutex> lock(queueMutex);
-		cv.wait(lock, [] { return !messageQueue.empty(); });
+		cv.wait(lock, [] {
+			return !messageQueue.empty() || exitFlag.load();
+		});
+
+		if (exitFlag.load() && messageQueue.empty()) {
+			break;
+		}
+
+		if (messageQueue.empty()) {
+			continue;
+		}
 
 		Packet packet = messageQueue.front();
 		messageQueue.pop();
@@ -86,6 +110,19 @@ void handleMessages()
 	}
 }
 
+void setSocketNonBlocking(int socket)
+{
+	int flags = fcntl(socket, F_GETFL, 0);
+	if (flags == -1) {
+		std::cerr << "Failed to get socket flags" << std::endl;
+		return;
+	}
+	if (fcntl(socket, F_SETFL, flags | O_NONBLOCK) == -1) {
+		std::cerr << "Failed to set socket to non-blocking"
+			  << std::endl;
+	}
+}
+
 void connectToServer(const std::string &ip, int port)
 {
 	clientSocket = socket(AF_INET, SOCK_STREAM, 0);
@@ -94,6 +131,8 @@ void connectToServer(const std::string &ip, int port)
 		return;
 	}
 
+	setSocketNonBlocking(clientSocket);
+
 	sockaddr_in serverAddr;
 	serverAddr.sin_family = AF_INET;
 	serverAddr.sin_port = htons(port);
@@ -101,7 +140,38 @@ void connectToServer(const std::string &ip, int port)
 
 	if (connect(clientSocket, (sockaddr *)&serverAddr,
 		    sizeof(serverAddr)) == -1) {
+		if (errno != EINPROGRESS) {
+			std::cerr << "Failed to connect to server" << std::endl;
+			close(clientSocket);
+			clientSocket = -1;
+			return;
+		}
+	}
+
+	fd_set writefds;
+	FD_ZERO(&writefds);
+	FD_SET(clientSocket, &writefds);
+	timeval timeout;
+	timeout.tv_sec = 5;
+	timeout.tv_usec = 0;
+
+	int result = select(clientSocket + 1, NULL, &writefds, NULL, &timeout);
+	if (result <= 0 || !FD_ISSET(clientSocket, &writefds)) {
 		std::cerr << "Failed to connect to server" << std::endl;
+		close(clientSocket);
+		clientSocket = -1;
+		return;
+	}
+
+	int so_error;
+	socklen_t len = sizeof(so_error);
+	getsockopt(clientSocket, SOL_SOCKET, SO_ERROR, &so_error, &len);
+	if (so_error != 0) {
+		std::cerr
+			<< "Failed to connect to server: " << strerror(so_error)
+			<< std::endl;
+		close(clientSocket);
+		clientSocket = -1;
 		return;
 	}
 
@@ -112,14 +182,15 @@ void connectToServer(const std::string &ip, int port)
 
 void disconnectFromServer()
 {
-	if (connected) {
-		connected = false;
-		close(clientSocket);
-		if (receiveThread.joinable()) {
-			receiveThread.join();
-		}
-		std::cout << "Disconnected from server" << std::endl;
+	if (!connected) {
+		return;
 	}
+	connected = false;
+	close(clientSocket);
+	if (receiveThread.joinable()) {
+		receiveThread.join();
+	}
+	std::cout << "Disconnected from server" << std::endl;
 }
 
 void sendRequest(PacketType type, const std::vector<uint8_t> &data = {})
@@ -192,9 +263,9 @@ void menu()
 			break;
 		}
 		case 7:
-			if (connected) {
-				disconnectFromServer();
-			}
+			disconnectFromServer();
+			exitFlag.store(true);
+			cv.notify_all();
 			return;
 		default:
 			std::cerr << "Invalid choice" << std::endl;
