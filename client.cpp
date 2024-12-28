@@ -71,6 +71,8 @@ void handleMessages()
 		messageQueue.pop();
 		lock.unlock();
 
+		std::cout << "\33[2K\r";
+
 		switch (packet.type) {
 		case RESPONSE_TIME:
 			std::cout << "Server Time: "
@@ -85,7 +87,7 @@ void handleMessages()
 				  << std::endl;
 			break;
 		case RESPONSE_CLIENT_LIST:
-			std::cout << "Client List: "
+			std::cout << "Client List: \n"
 				  << std::string(packet.data.begin(),
 						 packet.data.end())
 				  << std::endl;
@@ -107,6 +109,7 @@ void handleMessages()
 				  << std::endl;
 			break;
 		}
+		std::cout << "Enter your choice: " << std::flush;
 	}
 }
 
